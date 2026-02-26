@@ -1,0 +1,544 @@
+"""
+IntegraChat Cloud Licensing Server
+-----------------------------------
+Deploy to Railway / Render (free tier).
+Validates license keys for IntegraChat Server installations.
+
+Endpoints:
+  POST /validate          — called by IntegraChat server on startup
+  POST /stripe/webhook    — Stripe events (subscription.created/deleted)
+  GET  /admin             — simple admin dashboard (password-protected)
+  POST /admin/create      — manually create a license key
+  GET  /health            — health check
+"""
+
+import hashlib
+import hmac
+import os
+import secrets
+import sqlite3
+import string
+import time
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Optional
+
+import stripe
+from fastapi import FastAPI, Header, HTTPException, Request, Depends
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+DB_PATH             = Path(os.getenv("DB_PATH", "licenses.db"))
+STRIPE_SECRET_KEY   = os.getenv("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SEC  = os.getenv("STRIPE_WEBHOOK_SECRET", "")
+ADMIN_USER          = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASS          = os.getenv("ADMIN_PASS", "changeme")
+GRACE_PERIOD_DAYS   = 3   # allow 3-day grace after expiry (internet outage)
+MAX_DEVICES         = int(os.getenv("MAX_DEVICES", "10"))
+
+stripe.api_key = STRIPE_SECRET_KEY
+
+# ── Database ───────────────────────────────────────────────────────────────────
+def get_db():
+    con = sqlite3.connect(DB_PATH)
+    con.row_factory = sqlite3.Row
+    return con
+
+def init_db():
+    con = get_db()
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS licenses (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        key             TEXT    UNIQUE NOT NULL,
+        plan            TEXT    NOT NULL DEFAULT 'professional',
+        status          TEXT    NOT NULL DEFAULT 'active',   -- active|suspended|cancelled
+        stripe_sub_id   TEXT,
+        stripe_cust_id  TEXT,
+        customer_email  TEXT,
+        customer_name   TEXT,
+        max_devices     INTEGER NOT NULL DEFAULT 10,
+        created_at      TEXT    NOT NULL,
+        expires_at      TEXT                                 -- NULL = perpetual
+    );
+    CREATE TABLE IF NOT EXISTS activations (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        license_key TEXT NOT NULL,
+        machine_id  TEXT NOT NULL,
+        hostname    TEXT,
+        ip          TEXT,
+        first_seen  TEXT NOT NULL,
+        last_seen   TEXT NOT NULL,
+        UNIQUE(license_key, machine_id)
+    );
+    CREATE TABLE IF NOT EXISTS events (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts          TEXT NOT NULL,
+        type        TEXT NOT NULL,
+        license_key TEXT,
+        detail      TEXT
+    );
+    """)
+    con.commit()
+    con.close()
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+def gen_key() -> str:
+    """Generate IC-XXXX-XXXX-XXXX-XXXX format key."""
+    chars = string.ascii_uppercase + string.digits
+    parts = ["".join(secrets.choice(chars) for _ in range(4)) for _ in range(4)]
+    return "IC-" + "-".join(parts)
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def log_event(key: Optional[str], etype: str, detail: str = ""):
+    con = get_db()
+    con.execute("INSERT INTO events(ts,type,license_key,detail) VALUES(?,?,?,?)",
+                (now_iso(), etype, key, detail))
+    con.commit()
+    con.close()
+
+# ── Lifespan ───────────────────────────────────────────────────────────────────
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    # Create a built-in DEV key if none exist
+    con = get_db()
+    count = con.execute("SELECT COUNT(*) FROM licenses").fetchone()[0]
+    if count == 0:
+        dev_key = "IC-DEV0-TEST-0000-0001"
+        con.execute("""
+            INSERT OR IGNORE INTO licenses
+            (key, plan, status, customer_email, customer_name, max_devices, created_at)
+            VALUES (?,?,?,?,?,?,?)
+        """, (dev_key, "developer", "active", "dev@integrachat.io",
+              "Developer", 99, now_iso()))
+        con.commit()
+        print(f"[BOOT] Dev key created: {dev_key}")
+    con.close()
+    yield
+
+app = FastAPI(title="IntegraChat License Server", version="1.0.0", lifespan=lifespan)
+security = HTTPBasic()
+
+# ── Schemas ────────────────────────────────────────────────────────────────────
+class ValidateRequest(BaseModel):
+    license_key: str
+    machine_id:  str
+    hostname:    Optional[str] = None
+    version:     Optional[str] = None
+
+class ValidateResponse(BaseModel):
+    valid:      bool
+    plan:       str = ""
+    status:     str = ""
+    message:    str = ""
+    expires_at: Optional[str] = None
+    max_devices: int = 0
+
+class CreateLicenseRequest(BaseModel):
+    customer_email: str
+    customer_name:  str
+    plan:           str = "professional"
+    max_devices:    int = 10
+    expires_days:   Optional[int] = None  # None = perpetual
+
+# ── Admin auth ─────────────────────────────────────────────────────────────────
+def verify_admin(creds: HTTPBasicCredentials = Depends(security)):
+    ok_user = hmac.compare_digest(creds.username.encode(), ADMIN_USER.encode())
+    ok_pass = hmac.compare_digest(creds.password.encode(), ADMIN_PASS.encode())
+    if not (ok_user and ok_pass):
+        raise HTTPException(status_code=401, detail="Unauthorized",
+                            headers={"WWW-Authenticate": "Basic"})
+    return creds.username
+
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "ts": now_iso()}
+
+
+@app.post("/validate", response_model=ValidateResponse)
+async def validate_license(req: ValidateRequest, request: Request):
+    key = req.license_key.strip().upper()
+    con = get_db()
+    row = con.execute("SELECT * FROM licenses WHERE key=?", (key,)).fetchone()
+
+    if not row:
+        con.close()
+        log_event(key, "validate_fail", "key_not_found")
+        return ValidateResponse(valid=False, message="License key not found.")
+
+    if row["status"] == "suspended":
+        con.close()
+        log_event(key, "validate_fail", "suspended")
+        return ValidateResponse(valid=False, status="suspended",
+                                message="License suspended. Contact support.")
+
+    # Expiry check (with grace period)
+    if row["expires_at"]:
+        exp = datetime.fromisoformat(row["expires_at"])
+        grace = exp + timedelta(days=GRACE_PERIOD_DAYS)
+        if datetime.now(timezone.utc) > grace:
+            con.close()
+            log_event(key, "validate_fail", "expired")
+            return ValidateResponse(valid=False, status="expired",
+                                    message="License expired. Please renew.")
+
+    # Device limit check
+    machine_id = req.machine_id.strip()
+    existing = con.execute(
+        "SELECT COUNT(*) FROM activations WHERE license_key=?", (key,)
+    ).fetchone()[0]
+    known = con.execute(
+        "SELECT id FROM activations WHERE license_key=? AND machine_id=?",
+        (key, machine_id)
+    ).fetchone()
+
+    if not known and existing >= row["max_devices"]:
+        con.close()
+        log_event(key, "validate_fail", f"device_limit_{existing}")
+        return ValidateResponse(valid=False, status="device_limit",
+                                message=f"Device limit ({row['max_devices']}) reached.")
+
+    # Register/update activation
+    ip = request.client.host if request.client else "unknown"
+    ts = now_iso()
+    con.execute("""
+        INSERT INTO activations (license_key, machine_id, hostname, ip, first_seen, last_seen)
+        VALUES (?,?,?,?,?,?)
+        ON CONFLICT(license_key, machine_id) DO UPDATE SET last_seen=?, hostname=?, ip=?
+    """, (key, machine_id, req.hostname, ip, ts, ts, ts, req.hostname, ip))
+    con.commit()
+    con.close()
+
+    log_event(key, "validate_ok", f"machine={machine_id}")
+    return ValidateResponse(
+        valid       = True,
+        plan        = row["plan"],
+        status      = row["status"],
+        message     = "License valid.",
+        expires_at  = row["expires_at"],
+        max_devices = row["max_devices"],
+    )
+
+
+@app.post("/stripe/webhook")
+async def stripe_webhook(request: Request,
+                         stripe_signature: str = Header(None)):
+    payload = await request.body()
+    try:
+        event = stripe.Webhook.construct_event(
+            payload, stripe_signature, STRIPE_WEBHOOK_SEC
+        )
+    except stripe.error.SignatureVerificationError:
+        raise HTTPException(status_code=400, detail="Invalid signature")
+
+    etype = event["type"]
+    data  = event["data"]["object"]
+
+    if etype == "customer.subscription.created":
+        _handle_sub_created(data)
+    elif etype in ("customer.subscription.updated",):
+        _handle_sub_updated(data)
+    elif etype in ("customer.subscription.deleted",
+                   "customer.subscription.paused"):
+        _handle_sub_cancelled(data)
+    elif etype == "invoice.payment_failed":
+        _handle_payment_failed(data)
+    elif etype == "invoice.payment_succeeded":
+        _handle_payment_succeeded(data)
+
+    return {"received": True}
+
+
+def _handle_sub_created(sub):
+    con = get_db()
+    cust_id  = sub.get("customer")
+    sub_id   = sub.get("id")
+    email    = ""
+    name     = ""
+    # Fetch customer details
+    try:
+        cust  = stripe.Customer.retrieve(cust_id)
+        email = cust.get("email", "")
+        name  = cust.get("name", "") or email
+    except Exception:
+        pass
+
+    # Check if key already exists for this subscription
+    existing = con.execute(
+        "SELECT key FROM licenses WHERE stripe_sub_id=?", (sub_id,)
+    ).fetchone()
+    if existing:
+        con.close()
+        return
+
+    plan  = _plan_from_sub(sub)
+    key   = gen_key()
+    exp   = None
+    if sub.get("current_period_end"):
+        exp = datetime.fromtimestamp(
+            sub["current_period_end"], tz=timezone.utc
+        ).isoformat()
+
+    con.execute("""
+        INSERT INTO licenses
+        (key,plan,status,stripe_sub_id,stripe_cust_id,customer_email,customer_name,
+         max_devices,created_at,expires_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?)
+    """, (key, plan, "active", sub_id, cust_id, email, name,
+          MAX_DEVICES, now_iso(), exp))
+    con.commit()
+    con.close()
+    log_event(key, "created", f"stripe_sub={sub_id} email={email}")
+    print(f"[STRIPE] New license {key} for {email}")
+
+
+def _handle_sub_updated(sub):
+    sub_id = sub.get("id")
+    exp    = None
+    if sub.get("current_period_end"):
+        exp = datetime.fromtimestamp(
+            sub["current_period_end"], tz=timezone.utc
+        ).isoformat()
+    status = "active" if sub.get("status") == "active" else "suspended"
+    con = get_db()
+    con.execute(
+        "UPDATE licenses SET expires_at=?, status=? WHERE stripe_sub_id=?",
+        (exp, status, sub_id))
+    con.commit()
+    con.close()
+
+
+def _handle_sub_cancelled(sub):
+    sub_id = sub.get("id")
+    con = get_db()
+    row = con.execute(
+        "SELECT key FROM licenses WHERE stripe_sub_id=?", (sub_id,)
+    ).fetchone()
+    if row:
+        con.execute(
+            "UPDATE licenses SET status='cancelled' WHERE stripe_sub_id=?",
+            (sub_id,))
+        con.commit()
+        log_event(row["key"], "cancelled", f"stripe_sub={sub_id}")
+    con.close()
+
+
+def _handle_payment_failed(invoice):
+    sub_id = invoice.get("subscription")
+    if not sub_id:
+        return
+    con = get_db()
+    row = con.execute(
+        "SELECT key FROM licenses WHERE stripe_sub_id=?", (sub_id,)
+    ).fetchone()
+    if row:
+        log_event(row["key"], "payment_failed", f"invoice={invoice.get('id')}")
+    con.close()
+
+
+def _handle_payment_succeeded(invoice):
+    sub_id = invoice.get("subscription")
+    if not sub_id:
+        return
+    con = get_db()
+    row = con.execute(
+        "SELECT key FROM licenses WHERE stripe_sub_id=?", (sub_id,)
+    ).fetchone()
+    if row:
+        # Extend expiry by 31 days from now on successful payment
+        new_exp = (datetime.now(timezone.utc) + timedelta(days=31)).isoformat()
+        con.execute(
+            "UPDATE licenses SET expires_at=?, status='active' WHERE stripe_sub_id=?",
+            (new_exp, sub_id))
+        con.commit()
+        log_event(row["key"], "payment_ok", f"extended to {new_exp}")
+    con.close()
+
+
+def _plan_from_sub(sub) -> str:
+    try:
+        items = sub.get("items", {}).get("data", [])
+        if items:
+            nickname = items[0].get("price", {}).get("nickname", "")
+            if nickname:
+                return nickname.lower()
+    except Exception:
+        pass
+    return "professional"
+
+
+# ── Admin routes ───────────────────────────────────────────────────────────────
+
+@app.post("/admin/create")
+def admin_create(req: CreateLicenseRequest, _=Depends(verify_admin)):
+    key = gen_key()
+    exp = None
+    if req.expires_days:
+        exp = (datetime.now(timezone.utc) + timedelta(days=req.expires_days)).isoformat()
+    con = get_db()
+    con.execute("""
+        INSERT INTO licenses
+        (key,plan,status,customer_email,customer_name,max_devices,created_at,expires_at)
+        VALUES (?,?,?,?,?,?,?,?)
+    """, (key, req.plan, "active", req.customer_email, req.customer_name,
+          req.max_devices, now_iso(), exp))
+    con.commit()
+    con.close()
+    log_event(key, "manual_create", f"email={req.customer_email}")
+    return {"key": key, "expires_at": exp}
+
+
+@app.post("/admin/suspend/{key}")
+def admin_suspend(key: str, _=Depends(verify_admin)):
+    con = get_db()
+    con.execute("UPDATE licenses SET status='suspended' WHERE key=?", (key.upper(),))
+    con.commit()
+    con.close()
+    log_event(key.upper(), "suspended", "admin action")
+    return {"ok": True}
+
+
+@app.post("/admin/reinstate/{key}")
+def admin_reinstate(key: str, _=Depends(verify_admin)):
+    con = get_db()
+    con.execute("UPDATE licenses SET status='active' WHERE key=?", (key.upper(),))
+    con.commit()
+    con.close()
+    log_event(key.upper(), "reinstated", "admin action")
+    return {"ok": True}
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_dashboard(request: Request, _=Depends(verify_admin)):
+    con = get_db()
+    licenses = con.execute(
+        "SELECT * FROM licenses ORDER BY created_at DESC"
+    ).fetchall()
+    activations = con.execute(
+        "SELECT * FROM activations ORDER BY last_seen DESC LIMIT 100"
+    ).fetchall()
+    events = con.execute(
+        "SELECT * FROM events ORDER BY ts DESC LIMIT 50"
+    ).fetchall()
+    con.close()
+
+    lic_rows = ""
+    for l in licenses:
+        badge = {"active": "🟢", "suspended": "🔴", "cancelled": "⚫"}.get(l["status"], "🟡")
+        exp   = l["expires_at"][:10] if l["expires_at"] else "∞"
+        lic_rows += f"""
+        <tr>
+          <td><code>{l['key']}</code></td>
+          <td>{l['customer_name']}</td>
+          <td>{l['customer_email']}</td>
+          <td>{l['plan']}</td>
+          <td>{badge} {l['status']}</td>
+          <td>{exp}</td>
+          <td>{l['max_devices']}</td>
+          <td>{l['created_at'][:10]}</td>
+          <td>
+            <button onclick="act('/admin/suspend/{l['key']}','POST')">Suspend</button>
+            <button onclick="act('/admin/reinstate/{l['key']}','POST')">Reinstate</button>
+          </td>
+        </tr>"""
+
+    act_rows = ""
+    for a in activations:
+        act_rows += f"""
+        <tr>
+          <td><code>{a['license_key']}</code></td>
+          <td>{a['hostname'] or '—'}</td>
+          <td>{a['machine_id'][:16]}…</td>
+          <td>{a['ip']}</td>
+          <td>{a['last_seen'][:19]}</td>
+        </tr>"""
+
+    ev_rows = ""
+    for e in events:
+        ev_rows += f"<tr><td>{e['ts'][:19]}</td><td>{e['type']}</td><td>{e['license_key'] or ''}</td><td>{e['detail']}</td></tr>"
+
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<title>IntegraChat License Admin</title>
+<style>
+  body  {{ font-family: Segoe UI, sans-serif; background:#111; color:#eee; margin:0; padding:20px; }}
+  h1   {{ color:#fb8c00; }} h2 {{ color:#aaa; margin-top:30px; }}
+  table {{ border-collapse:collapse; width:100%; margin-top:10px; }}
+  th,td {{ border:1px solid #333; padding:8px 12px; text-align:left; font-size:13px; }}
+  th    {{ background:#1e1e1e; color:#fb8c00; }}
+  tr:nth-child(even) {{ background:#181818; }}
+  code  {{ color:#00bcd4; }}
+  button {{ background:#333; color:#eee; border:1px solid #555; padding:4px 10px;
+            border-radius:4px; cursor:pointer; margin:2px; }}
+  button:hover {{ background:#fb8c00; color:#000; }}
+  .create-form {{ background:#1e1e1e; padding:16px; border-radius:8px; margin:20px 0; }}
+  .create-form input,select {{ background:#252525; color:#eee; border:1px solid #444;
+    padding:6px 10px; margin:4px; border-radius:4px; }}
+  .create-form button {{ background:#fb8c00; color:#000; font-weight:bold; padding:8px 18px; }}
+</style>
+</head>
+<body>
+<h1>🔑 IntegraChat License Admin</h1>
+
+<div class="create-form">
+  <h2 style="margin-top:0">Create License</h2>
+  <input id="email" placeholder="customer@email.com" size="30">
+  <input id="name"  placeholder="Office Name" size="25">
+  <select id="plan">
+    <option value="professional">Professional ($99/mo)</option>
+    <option value="enterprise">Enterprise ($199/mo)</option>
+    <option value="developer">Developer (free)</option>
+  </select>
+  <input id="days" placeholder="Days (blank=∞)" size="10" type="number">
+  <input id="devs" value="10" size="5" type="number">
+  <button onclick="createKey()">Generate Key</button>
+  <div id="newkey" style="margin-top:10px;font-size:18px;color:#00bcd4"></div>
+</div>
+
+<h2>Active Licenses ({len(licenses)})</h2>
+<table><tr>
+  <th>Key</th><th>Name</th><th>Email</th><th>Plan</th><th>Status</th>
+  <th>Expires</th><th>Max Devices</th><th>Created</th><th>Actions</th>
+</tr>{lic_rows}</table>
+
+<h2>Device Activations</h2>
+<table><tr><th>Key</th><th>Hostname</th><th>Machine ID</th><th>IP</th><th>Last Seen</th></tr>
+{act_rows}</table>
+
+<h2>Recent Events</h2>
+<table><tr><th>Time</th><th>Type</th><th>Key</th><th>Detail</th></tr>
+{ev_rows}</table>
+
+<script>
+async function act(url, method) {{
+  if(!confirm('Confirm action?')) return;
+  const r = await fetch(url, {{method, headers:{{'Authorization':'Basic '+btoa('{ADMIN_USER}:{ADMIN_PASS}')}}  }});
+  location.reload();
+}}
+async function createKey() {{
+  const body = {{
+    customer_email: document.getElementById('email').value,
+    customer_name:  document.getElementById('name').value,
+    plan:           document.getElementById('plan').value,
+    max_devices:    parseInt(document.getElementById('devs').value)||10,
+    expires_days:   parseInt(document.getElementById('days').value)||null
+  }};
+  const r = await fetch('/admin/create',{{
+    method:'POST',
+    headers:{{'Content-Type':'application/json',
+              'Authorization':'Basic '+btoa('{ADMIN_USER}:{ADMIN_PASS}')}},
+    body: JSON.stringify(body)
+  }});
+  const d = await r.json();
+  document.getElementById('newkey').innerHTML = '✅ Key: <b>'+d.key+'</b>';
+}}
+</script>
+</body></html>"""

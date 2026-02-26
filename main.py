@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 import stripe
+import resend
 from fastapi import FastAPI, Header, HTTPException, Request, Depends
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
@@ -38,6 +39,72 @@ ADMIN_USER          = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS          = os.getenv("ADMIN_PASS", "changeme")
 GRACE_PERIOD_DAYS   = 3   # allow 3-day grace after expiry (internet outage)
 MAX_DEVICES         = int(os.getenv("MAX_DEVICES", "10"))
+RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
+FROM_EMAIL          = os.getenv("FROM_EMAIL", "licenses@integrachat.com")
+DOWNLOAD_URL        = os.getenv("DOWNLOAD_URL", "https://integrachat.com/download")
+
+resend.api_key = RESEND_API_KEY
+
+
+# ── Email ──────────────────────────────────────────────────────────────────────
+def send_license_email(to_email: str, customer_name: str, key: str,
+                       expires_at: Optional[str], plan: str):
+    """Send license key + download instructions to new customer."""
+    if not RESEND_API_KEY:
+        print(f"[EMAIL] No RESEND_API_KEY set — skipping email to {to_email}")
+        return
+
+    expires_str = ""
+    if expires_at:
+        try:
+            dt = datetime.fromisoformat(expires_at)
+            expires_str = f"<p>Your license is valid until <strong>{dt.strftime('%B %d, %Y')}</strong>.</p>"
+        except Exception:
+            expires_str = f"<p>Expires: {expires_at}</p>"
+
+    html = f"""
+    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0e0e0e;color:#e0e0e0;border-radius:12px;overflow:hidden;">
+      <div style="background:#1a1a1a;padding:32px 40px;text-align:center;border-bottom:1px solid #333;">
+        <h1 style="color:#C0C0C0;margin:0;font-size:28px;">IntegraChat</h1>
+        <p style="color:#888;margin:4px 0 0;">Office Paging System</p>
+      </div>
+      <div style="padding:40px;">
+        <h2 style="color:#fff;margin-top:0;">Welcome, {customer_name}!</h2>
+        <p>Thank you for your purchase. Your <strong>{plan.title()}</strong> license is ready.</p>
+
+        <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:20px;margin:24px 0;text-align:center;">
+          <p style="color:#888;margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:1px;">Your License Key</p>
+          <p style="color:#C0C0C0;font-size:24px;font-family:monospace;letter-spacing:3px;margin:0;"><strong>{key}</strong></p>
+        </div>
+
+        {expires_str}
+
+        <h3 style="color:#C0C0C0;">Getting Started</h3>
+        <ol style="line-height:2;">
+          <li><a href="{DOWNLOAD_URL}" style="color:#C0C0C0;">Download the IntegraChat Server installer</a></li>
+          <li>Run <strong>IntegraChat_Setup.exe</strong> on your office Windows PC</li>
+          <li>Launch IntegraChat — click <strong>License</strong> in the sidebar</li>
+          <li>Paste your license key above and click <strong>Activate</strong></li>
+          <li>Install the <strong>IntegraChat app</strong> on your office tablets (Android APK available on the download page)</li>
+        </ol>
+
+        <p style="color:#888;font-size:13px;">Need help? Reply to this email or visit our support page.</p>
+      </div>
+      <div style="background:#1a1a1a;padding:16px 40px;text-align:center;border-top:1px solid #333;">
+        <p style="color:#555;font-size:12px;margin:0;">IntegraChat — A.N.T. Dental Integration &nbsp;|&nbsp; antondental@integrachat.com</p>
+      </div>
+    </div>
+    """
+    try:
+        resend.Emails.send({
+            "from": FROM_EMAIL,
+            "to": [to_email],
+            "subject": f"Your IntegraChat License Key — {key}",
+            "html": html,
+        })
+        print(f"[EMAIL] Sent license to {to_email}")
+    except Exception as e:
+        print(f"[EMAIL] Failed to send to {to_email}: {e}")
 
 stripe.api_key = STRIPE_SECRET_KEY
 
@@ -297,6 +364,7 @@ def _handle_sub_created(sub):
     con.close()
     log_event(key, "created", f"stripe_sub={sub_id} email={email}")
     print(f"[STRIPE] New license {key} for {email}")
+    send_license_email(email, name, key, exp, plan)
 
 
 def _handle_sub_updated(sub):
@@ -392,6 +460,7 @@ def admin_create(req: CreateLicenseRequest, _=Depends(verify_admin)):
     con.commit()
     con.close()
     log_event(key, "manual_create", f"email={req.customer_email}")
+    send_license_email(req.customer_email, req.customer_name, key, exp, req.plan)
     return {"key": key, "expires_at": exp}
 
 

@@ -239,7 +239,13 @@ def verify_admin(creds: HTTPBasicCredentials = Depends(security)):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "ts": now_iso(), "build": "v5-fix3"}
+    return {
+        "status": "ok",
+        "ts": now_iso(),
+        "build": "v5-fix4",
+        "wh_secret_set": bool(STRIPE_WEBHOOK_SEC),
+        "wh_secret_prefix": STRIPE_WEBHOOK_SEC[:12] if STRIPE_WEBHOOK_SEC else "MISSING"
+    }
 
 
 @app.post("/debug/webhook-sim")

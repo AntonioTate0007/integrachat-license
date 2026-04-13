@@ -38,10 +38,17 @@ STRIPE_WEBHOOK_SEC  = os.getenv("STRIPE_WEBHOOK_SECRET", "")
 ADMIN_USER          = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS          = os.getenv("ADMIN_PASS", "changeme")
 GRACE_PERIOD_DAYS   = 3   # allow 3-day grace after expiry (internet outage)
-MAX_DEVICES         = int(os.getenv("MAX_DEVICES", "10"))
 RESEND_API_KEY      = os.getenv("RESEND_API_KEY", "")
 FROM_EMAIL          = os.getenv("FROM_EMAIL", "licenses@integrachat.com")
 DOWNLOAD_URL        = os.getenv("DOWNLOAD_URL", "https://integrachat.com/download")
+
+# Stripe Price IDs — set these as Railway env vars
+# Copy them from Stripe Dashboard -> Products -> each price's API ID
+STRIPE_STARTER_PRICE_ID = os.getenv("STRIPE_STARTER_PRICE_ID", "")
+STRIPE_PRO_PRICE_ID     = os.getenv("STRIPE_PRO_PRICE_ID", "")
+
+# Seat limits per plan
+PLAN_DEVICES = {"starter": 5, "professional": 15, "enterprise": 50}
 
 resend.api_key = RESEND_API_KEY
 
@@ -210,8 +217,14 @@ class CreateLicenseRequest(BaseModel):
     customer_email: str
     customer_name:  str
     plan:           str = "professional"
-    max_devices:    int = 10
-    expires_days:   Optional[int] = None  # None = perpetual
+    max_devices:    Optional[int] = None   # auto from plan if not set
+    expires_days:   Optional[int] = None   # None = perpetual
+
+    @property
+    def resolved_devices(self) -> int:
+        if self.max_devices is not None:
+            return self.max_devices
+        return PLAN_DEVICES.get(self.plan.lower(), 10)
 
 # ── Admin auth ─────────────────────────────────────────────────────────────────
 def verify_admin(creds: HTTPBasicCredentials = Depends(security)):
@@ -226,7 +239,28 @@ def verify_admin(creds: HTTPBasicCredentials = Depends(security)):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "ts": now_iso()}
+    return {"status": "ok", "ts": now_iso(), "build": "v5-fix3"}
+
+
+@app.post("/debug/webhook-sim")
+def debug_webhook_sim(_=Depends(verify_admin)):
+    """Simulate a subscription.created event for testing (admin only)."""
+    import traceback
+    test_data = {
+        "id": "sub_debug_001",
+        "customer": "cus_debug",
+        "status": "active",
+        "current_period_end": int(__import__("time").time()) + 2592000,
+        "items": {"data": [{"price": {"id": "price_1TLCCO21fYeC9E5lPKg3cDf3", "nickname": "Starter"}}]}
+    }
+    try:
+        _handle_sub_created(test_data)
+        con = get_db()
+        row = con.execute("SELECT key FROM licenses WHERE stripe_sub_id='sub_debug_001'").fetchone()
+        con.close()
+        return {"ok": True, "key": row["key"] if row else "not found"}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "trace": traceback.format_exc()}
 
 
 @app.post("/validate", response_model=ValidateResponse)
@@ -302,38 +336,63 @@ async def stripe_webhook(request: Request,
         event = stripe.Webhook.construct_event(
             payload, stripe_signature, STRIPE_WEBHOOK_SEC
         )
-    except stripe.error.SignatureVerificationError:
+    except Exception as e:
+        print(f"[WEBHOOK] Signature error: {e}")
         raise HTTPException(status_code=400, detail="Invalid signature")
 
-    etype = event["type"]
-    data  = event["data"]["object"]
+    # Support both Stripe SDK v9+ (attribute access) and dict-style
+    raw = event if isinstance(event, dict) else event.to_dict_recursive() if hasattr(event, 'to_dict_recursive') else dict(event)
+    etype = raw.get("type", "")
+    data  = raw.get("data", {}).get("object", {})
 
-    if etype == "customer.subscription.created":
-        _handle_sub_created(data)
-    elif etype in ("customer.subscription.updated",):
-        _handle_sub_updated(data)
-    elif etype in ("customer.subscription.deleted",
-                   "customer.subscription.paused"):
-        _handle_sub_cancelled(data)
-    elif etype == "invoice.payment_failed":
-        _handle_payment_failed(data)
-    elif etype == "invoice.payment_succeeded":
-        _handle_payment_succeeded(data)
+    print(f"[WEBHOOK] Received: {etype}")
+    try:
+        if etype == "customer.subscription.created":
+            _handle_sub_created(data)
+        elif etype in ("customer.subscription.updated",):
+            _handle_sub_updated(data)
+        elif etype in ("customer.subscription.deleted",
+                       "customer.subscription.paused"):
+            _handle_sub_cancelled(data)
+        elif etype == "invoice.payment_failed":
+            _handle_payment_failed(data)
+        elif etype == "invoice.payment_succeeded":
+            _handle_payment_succeeded(data)
+        else:
+            print(f"[WEBHOOK] Ignored event type: {etype}")
+    except Exception as e:
+        print(f"[WEBHOOK] Handler error for {etype}: {e}")
+        import traceback; traceback.print_exc()
 
     return {"received": True}
 
 
+def _sg(obj, key, default=None):
+    """Safe getter for Stripe SDK v9+ objects (attribute-based) and plain dicts."""
+    # Stripe SDK v9+ uses attribute access; fall back to dict access for plain dicts
+    v = getattr(obj, key, _MISSING)
+    if v is not _MISSING:
+        return v if v is not None else default
+    try:
+        v = obj[key]
+        return v if v is not None else default
+    except (KeyError, TypeError, AttributeError):
+        return default
+
+_MISSING = object()
+
+
 def _handle_sub_created(sub):
     con = get_db()
-    cust_id  = sub.get("customer")
-    sub_id   = sub.get("id")
+    cust_id  = _sg(sub, "customer")
+    sub_id   = _sg(sub, "id")
     email    = ""
     name     = ""
     # Fetch customer details
     try:
         cust  = stripe.Customer.retrieve(cust_id)
-        email = cust.get("email", "")
-        name  = cust.get("name", "") or email
+        email = _sg(cust, "email", "")
+        name  = _sg(cust, "name", "") or email
     except Exception:
         pass
 
@@ -347,10 +406,11 @@ def _handle_sub_created(sub):
 
     plan  = _plan_from_sub(sub)
     key   = gen_key()
+    seats = PLAN_DEVICES.get(plan, 10)
     exp   = None
-    if sub.get("current_period_end"):
+    if _sg(sub, "current_period_end"):
         exp = datetime.fromtimestamp(
-            sub["current_period_end"], tz=timezone.utc
+            _sg(sub, "current_period_end"), tz=timezone.utc
         ).isoformat()
 
     con.execute("""
@@ -359,7 +419,7 @@ def _handle_sub_created(sub):
          max_devices,created_at,expires_at)
         VALUES (?,?,?,?,?,?,?,?,?,?)
     """, (key, plan, "active", sub_id, cust_id, email, name,
-          MAX_DEVICES, now_iso(), exp))
+          seats, now_iso(), exp))
     con.commit()
     con.close()
     log_event(key, "created", f"stripe_sub={sub_id} email={email}")
@@ -368,13 +428,13 @@ def _handle_sub_created(sub):
 
 
 def _handle_sub_updated(sub):
-    sub_id = sub.get("id")
+    sub_id = _sg(sub, "id")
     exp    = None
-    if sub.get("current_period_end"):
+    if _sg(sub, "current_period_end"):
         exp = datetime.fromtimestamp(
-            sub["current_period_end"], tz=timezone.utc
+            _sg(sub, "current_period_end"), tz=timezone.utc
         ).isoformat()
-    status = "active" if sub.get("status") == "active" else "suspended"
+    status = "active" if _sg(sub, "status") == "active" else "suspended"
     con = get_db()
     con.execute(
         "UPDATE licenses SET expires_at=?, status=? WHERE stripe_sub_id=?",
@@ -384,7 +444,7 @@ def _handle_sub_updated(sub):
 
 
 def _handle_sub_cancelled(sub):
-    sub_id = sub.get("id")
+    sub_id = _sg(sub, "id")
     con = get_db()
     row = con.execute(
         "SELECT key FROM licenses WHERE stripe_sub_id=?", (sub_id,)
@@ -399,7 +459,7 @@ def _handle_sub_cancelled(sub):
 
 
 def _handle_payment_failed(invoice):
-    sub_id = invoice.get("subscription")
+    sub_id = _sg(invoice, "subscription")
     if not sub_id:
         return
     con = get_db()
@@ -407,12 +467,12 @@ def _handle_payment_failed(invoice):
         "SELECT key FROM licenses WHERE stripe_sub_id=?", (sub_id,)
     ).fetchone()
     if row:
-        log_event(row["key"], "payment_failed", f"invoice={invoice.get('id')}")
+        log_event(row["key"], "payment_failed", f"invoice={_sg(invoice, 'id')}")
     con.close()
 
 
 def _handle_payment_succeeded(invoice):
-    sub_id = invoice.get("subscription")
+    sub_id = _sg(invoice, "subscription")
     if not sub_id:
         return
     con = get_db()
@@ -420,7 +480,6 @@ def _handle_payment_succeeded(invoice):
         "SELECT key FROM licenses WHERE stripe_sub_id=?", (sub_id,)
     ).fetchone()
     if row:
-        # Extend expiry by 31 days from now on successful payment
         new_exp = (datetime.now(timezone.utc) + timedelta(days=31)).isoformat()
         con.execute(
             "UPDATE licenses SET expires_at=?, status='active' WHERE stripe_sub_id=?",
@@ -431,12 +490,26 @@ def _handle_payment_succeeded(invoice):
 
 
 def _plan_from_sub(sub) -> str:
+    """Determine plan from Stripe subscription.
+    Checks (in order): price ID env var match -> price nickname -> default."""
     try:
-        items = sub.get("items", {}).get("data", [])
+        items = _sg(_sg(sub, "items", {}), "data", [])
         if items:
-            nickname = items[0].get("price", {}).get("nickname", "")
-            if nickname:
-                return nickname.lower()
+            price    = _sg(items[0], "price", {})
+            price_id = _sg(price, "id", "")
+            nickname = (_sg(price, "nickname") or "").lower().strip()
+
+            if STRIPE_STARTER_PRICE_ID and price_id == STRIPE_STARTER_PRICE_ID:
+                return "starter"
+            if STRIPE_PRO_PRICE_ID and price_id == STRIPE_PRO_PRICE_ID:
+                return "professional"
+
+            if "starter" in nickname or "basic" in nickname or "lite" in nickname:
+                return "starter"
+            if "pro" in nickname or "professional" in nickname:
+                return "professional"
+            if "enterprise" in nickname:
+                return "enterprise"
     except Exception:
         pass
     return "professional"
@@ -456,7 +529,7 @@ def admin_create(req: CreateLicenseRequest, _=Depends(verify_admin)):
         (key,plan,status,customer_email,customer_name,max_devices,created_at,expires_at)
         VALUES (?,?,?,?,?,?,?,?)
     """, (key, req.plan, "active", req.customer_email, req.customer_name,
-          req.max_devices, now_iso(), exp))
+          req.resolved_devices, now_iso(), exp))
     con.commit()
     con.close()
     log_event(key, "manual_create", f"email={req.customer_email}")

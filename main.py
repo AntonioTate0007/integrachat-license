@@ -338,37 +338,25 @@ async def validate_license(req: ValidateRequest, request: Request):
 async def stripe_webhook(request: Request,
                          stripe_signature: str = Header(None)):
     payload = await request.body()
-    print(f"[WEBHOOK] Received sig header: {stripe_signature[:60] if stripe_signature else 'NONE'}")
-    print(f"[WEBHOOK] Payload size: {len(payload)} bytes")
+    print(f"[WEBHOOK] Received, size={len(payload)}")
     try:
-        event = stripe.Webhook.construct_event(
-            payload, stripe_signature, STRIPE_WEBHOOK_SEC
-        )
+        # verify signature only — we'll parse the raw JSON ourselves
+        stripe.Webhook.construct_event(payload, stripe_signature, STRIPE_WEBHOOK_SEC)
     except Exception as e:
         print(f"[WEBHOOK] Signature FAILED: {type(e).__name__}: {e}")
-        # Temporarily log raw for debugging, still reject
-        raise HTTPException(status_code=400, detail=f"Invalid signature: {type(e).__name__}")
+        raise HTTPException(status_code=400, detail=f"Invalid signature")
 
-    # Stripe SDK v9+ Event — use attribute access directly
-    etype = getattr(event, "type", None) or (event.get("type") if isinstance(event, dict) else "")
-    obj   = getattr(event, "data", None)
-    if obj is not None:
-        data = getattr(obj, "object", None) or {}
-    elif isinstance(event, dict):
-        data = event.get("data", {}).get("object", {})
-    else:
-        data = {}
-    # Normalise to plain dict for handlers
-    if hasattr(data, "to_dict"):
-        data = data.to_dict()
-    elif not isinstance(data, dict):
-        data = dict(data)
+    # Parse as plain dict — works regardless of Stripe SDK version
+    import json as _json
+    raw   = _json.loads(payload)
+    etype = raw.get("type", "")
+    data  = raw.get("data", {}).get("object", {})
 
     print(f"[WEBHOOK] Event verified OK: {etype}")
     try:
         if etype == "customer.subscription.created":
             _handle_sub_created(data)
-        elif etype in ("customer.subscription.updated",):
+        elif etype == "customer.subscription.updated":
             _handle_sub_updated(data)
         elif etype in ("customer.subscription.deleted",
                        "customer.subscription.paused"):
@@ -378,7 +366,7 @@ async def stripe_webhook(request: Request,
         elif etype == "invoice.payment_succeeded":
             _handle_payment_succeeded(data)
         else:
-            print(f"[WEBHOOK] Ignored event type: {etype}")
+            print(f"[WEBHOOK] Ignored: {etype}")
     except Exception as e:
         print(f"[WEBHOOK] Handler error for {etype}: {e}")
         import traceback; traceback.print_exc()

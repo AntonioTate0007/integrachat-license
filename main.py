@@ -349,10 +349,20 @@ async def stripe_webhook(request: Request,
         # Temporarily log raw for debugging, still reject
         raise HTTPException(status_code=400, detail=f"Invalid signature: {type(e).__name__}")
 
-    # Support both Stripe SDK v9+ (attribute access) and dict-style
-    raw = event if isinstance(event, dict) else event.to_dict_recursive() if hasattr(event, 'to_dict_recursive') else dict(event)
-    etype = raw.get("type", "")
-    data  = raw.get("data", {}).get("object", {})
+    # Stripe SDK v9+ Event — use attribute access directly
+    etype = getattr(event, "type", None) or (event.get("type") if isinstance(event, dict) else "")
+    obj   = getattr(event, "data", None)
+    if obj is not None:
+        data = getattr(obj, "object", None) or {}
+    elif isinstance(event, dict):
+        data = event.get("data", {}).get("object", {})
+    else:
+        data = {}
+    # Normalise to plain dict for handlers
+    if hasattr(data, "to_dict"):
+        data = data.to_dict()
+    elif not isinstance(data, dict):
+        data = dict(data)
 
     print(f"[WEBHOOK] Event verified OK: {etype}")
     try:

@@ -338,20 +338,23 @@ async def validate_license(req: ValidateRequest, request: Request):
 async def stripe_webhook(request: Request,
                          stripe_signature: str = Header(None)):
     payload = await request.body()
+    print(f"[WEBHOOK] Received sig header: {stripe_signature[:60] if stripe_signature else 'NONE'}")
+    print(f"[WEBHOOK] Payload size: {len(payload)} bytes")
     try:
         event = stripe.Webhook.construct_event(
             payload, stripe_signature, STRIPE_WEBHOOK_SEC
         )
     except Exception as e:
-        print(f"[WEBHOOK] Signature error: {e}")
-        raise HTTPException(status_code=400, detail="Invalid signature")
+        print(f"[WEBHOOK] Signature FAILED: {type(e).__name__}: {e}")
+        # Temporarily log raw for debugging, still reject
+        raise HTTPException(status_code=400, detail=f"Invalid signature: {type(e).__name__}")
 
     # Support both Stripe SDK v9+ (attribute access) and dict-style
     raw = event if isinstance(event, dict) else event.to_dict_recursive() if hasattr(event, 'to_dict_recursive') else dict(event)
     etype = raw.get("type", "")
     data  = raw.get("data", {}).get("object", {})
 
-    print(f"[WEBHOOK] Received: {etype}")
+    print(f"[WEBHOOK] Event verified OK: {etype}")
     try:
         if etype == "customer.subscription.created":
             _handle_sub_created(data)

@@ -178,7 +178,7 @@ def send_license_email(to_email: str, customer_name: str, key: str,
           </tr>
           <tr>
             <td style="padding:4px 0;font-size:13px;color:#475569;">📞 &nbsp;Phone Support</td>
-            <td style="padding:4px 0;padding-left:16px;"><a href="tel:+14075551234" style="color:#ff6b35;text-decoration:none;font-size:13px;font-weight:600;">(407) 555-1234</a></td>
+            <td style="padding:4px 0;padding-left:16px;"><a href="tel:+13526040691" style="color:#ff6b35;text-decoration:none;font-size:13px;font-weight:600;">(352) 604-0691</a></td>
           </tr>
           <tr>
             <td style="padding:4px 0;font-size:13px;color:#475569;">🌐 &nbsp;Website</td>
@@ -195,7 +195,7 @@ def send_license_email(to_email: str, customer_name: str, key: str,
     <p style="margin:0 0 6px;color:#64748b;font-size:12px;">IntegraChat &nbsp;|&nbsp; Intelligent Office Paging for Dental Practices</p>
     <p style="margin:0;color:#64748b;font-size:12px;">
       <a href="https://integrachatapp.com" style="color:#ff6b35;text-decoration:none;">integrachatapp.com</a>
-      &nbsp;&bull;&nbsp; support@integrachatapp.com &nbsp;&bull;&nbsp; (407) 555-1234
+      &nbsp;&bull;&nbsp; support@integrachatapp.com &nbsp;&bull;&nbsp; (352) 604-0691
     </p>
     <p style="margin:12px 0 0;color:#334155;font-size:11px;">You received this email because you purchased an IntegraChat license.</p>
   </td></tr>

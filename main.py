@@ -65,48 +65,152 @@ def send_license_email(to_email: str, customer_name: str, key: str,
     if expires_at:
         try:
             dt = datetime.fromisoformat(expires_at)
-            expires_str = f"<p>Your license is valid until <strong>{dt.strftime('%B %d, %Y')}</strong>.</p>"
+            expires_str = f"""
+            <tr>
+              <td style="padding:6px 0;color:#888;font-size:13px;">Valid Until</td>
+              <td style="padding:6px 0;color:#fff;font-size:13px;text-align:right;"><strong>{dt.strftime('%B %d, %Y')}</strong></td>
+            </tr>"""
         except Exception:
-            expires_str = f"<p>Expires: {expires_at}</p>"
+            pass
 
-    html = f"""
-    <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#0e0e0e;color:#e0e0e0;border-radius:12px;overflow:hidden;">
-      <div style="background:#1a1a1a;padding:32px 40px;text-align:center;border-bottom:1px solid #333;">
-        <h1 style="color:#C0C0C0;margin:0;font-size:28px;">IntegraChat</h1>
-        <p style="color:#888;margin:4px 0 0;">Office Paging System</p>
-      </div>
-      <div style="padding:40px;">
-        <h2 style="color:#fff;margin-top:0;">Welcome, {customer_name}!</h2>
-        <p>Thank you for your purchase. Your <strong>{plan.title()}</strong> license is ready.</p>
+    plan_badge = {"starter": "#3b82f6", "professional": "#8b5cf6", "enterprise": "#f59e0b", "developer": "#10b981"}.get(plan.lower(), "#3b82f6")
 
-        <div style="background:#1a1a1a;border:1px solid #333;border-radius:8px;padding:20px;margin:24px 0;text-align:center;">
-          <p style="color:#888;margin:0 0 8px;font-size:12px;text-transform:uppercase;letter-spacing:1px;">Your License Key</p>
-          <p style="color:#C0C0C0;font-size:24px;font-family:monospace;letter-spacing:3px;margin:0;"><strong>{key}</strong></p>
-        </div>
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Your IntegraChat License</title></head>
+<body style="margin:0;padding:0;background:#f0f2f5;font-family:'Segoe UI',Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f0f2f5;padding:40px 0;">
+<tr><td align="center">
+<table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
 
-        {expires_str}
+  <!-- HEADER -->
+  <tr><td style="background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);border-radius:12px 12px 0 0;padding:36px 48px;text-align:center;">
+    <img src="https://integrachatapp.com/ic-logo.png" alt="IntegraChat" width="64" height="64"
+         style="border-radius:12px;margin-bottom:16px;display:block;margin-left:auto;margin-right:auto;"
+         onerror="this.style.display='none'">
+    <h1 style="margin:0;font-size:28px;font-weight:700;color:#ffffff;letter-spacing:-0.5px;">IntegraChat</h1>
+    <p style="margin:6px 0 0;color:#94a3b8;font-size:14px;">Intelligent Office Paging System</p>
+  </td></tr>
 
-        <h3 style="color:#C0C0C0;">Getting Started</h3>
-        <ol style="line-height:2;">
-          <li><a href="{DOWNLOAD_URL}" style="color:#C0C0C0;">Download the IntegraChat Server installer</a></li>
-          <li>Run <strong>IntegraChat_Setup.exe</strong> on your office Windows PC</li>
-          <li>Launch IntegraChat — click <strong>License</strong> in the sidebar</li>
-          <li>Paste your license key above and click <strong>Activate</strong></li>
-          <li>Install the <strong>IntegraChat app</strong> on your office tablets (Android APK available on the download page)</li>
-        </ol>
+  <!-- WELCOME BANNER -->
+  <tr><td style="background:#ff6b35;padding:14px 48px;text-align:center;">
+    <p style="margin:0;color:#fff;font-size:15px;font-weight:600;">🎉 &nbsp;Your license is ready to activate!</p>
+  </td></tr>
 
-        <p style="color:#888;font-size:13px;">Need help? Reply to this email or visit our support page.</p>
-      </div>
-      <div style="background:#1a1a1a;padding:16px 40px;text-align:center;border-top:1px solid #333;">
-        <p style="color:#555;font-size:12px;margin:0;">IntegraChat — A.N.T. Dental Integration &nbsp;|&nbsp; antondental@integrachat.com</p>
-      </div>
-    </div>
-    """
+  <!-- BODY -->
+  <tr><td style="background:#ffffff;padding:40px 48px;">
+
+    <p style="margin:0 0 8px;font-size:18px;font-weight:600;color:#1a1a2e;">Hi {customer_name},</p>
+    <p style="margin:0 0 28px;font-size:15px;color:#475569;line-height:1.6;">
+      Thank you for choosing IntegraChat! Your <strong>{plan.title()} Plan</strong> license is active and ready to use.
+      Below are everything you need to get your office paging system running in minutes.
+    </p>
+
+    <!-- LICENSE KEY BOX -->
+    <table width="100%" cellpadding="0" cellspacing="0" style="background:#1a1a2e;border-radius:10px;margin-bottom:28px;">
+      <tr><td style="padding:24px 28px;">
+        <p style="margin:0 0 6px;font-size:11px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:2px;">Your License Key</p>
+        <p style="margin:0 0 16px;font-size:22px;font-family:'Courier New',monospace;font-weight:700;color:#ff6b35;letter-spacing:4px;">{key}</p>
+        <table cellpadding="0" cellspacing="0">
+          <tr>
+            <td style="background:{plan_badge};border-radius:20px;padding:4px 14px;">
+              <span style="color:#fff;font-size:12px;font-weight:700;text-transform:uppercase;">{plan.title()} Plan</span>
+            </td>
+          </tr>
+        </table>
+      </td></tr>
+    </table>
+
+    <!-- LICENSE DETAILS -->
+    <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e2e8f0;border-radius:8px;margin-bottom:28px;">
+      <tr><td style="padding:16px 20px;border-bottom:1px solid #e2e8f0;">
+        <p style="margin:0;font-size:12px;font-weight:700;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;">License Details</p>
+      </td></tr>
+      <tr><td style="padding:12px 20px;">
+        <table width="100%" cellpadding="0" cellspacing="0">
+          <tr>
+            <td style="padding:6px 0;color:#64748b;font-size:13px;">Plan</td>
+            <td style="padding:6px 0;color:#1a1a2e;font-size:13px;text-align:right;"><strong>{plan.title()}</strong></td>
+          </tr>
+          <tr>
+            <td style="padding:6px 0;color:#64748b;font-size:13px;">Registered To</td>
+            <td style="padding:6px 0;color:#1a1a2e;font-size:13px;text-align:right;"><strong>{to_email}</strong></td>
+          </tr>
+          {expires_str}
+        </table>
+      </td></tr>
+    </table>
+
+    <!-- GETTING STARTED -->
+    <p style="margin:0 0 16px;font-size:15px;font-weight:700;color:#1a1a2e;">Getting Started in 4 Steps</p>
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:28px;">
+      {"".join([f'''<tr><td style="padding:10px 0;border-bottom:1px solid #f1f5f9;vertical-align:top;">
+        <table cellpadding="0" cellspacing="0"><tr>
+          <td style="width:32px;height:32px;background:#ff6b35;border-radius:50%;text-align:center;vertical-align:middle;">
+            <span style="color:#fff;font-weight:700;font-size:13px;">{i}</span>
+          </td>
+          <td style="padding-left:14px;color:#475569;font-size:14px;line-height:1.5;">{step}</td>
+        </tr></table>
+      </td></tr>''' for i, step in [
+        (1, f'<a href="{DOWNLOAD_URL}" style="color:#ff6b35;font-weight:600;">Download the IntegraChat Server</a> and run <strong>IntegraChat_Setup.exe</strong> on your office Windows PC'),
+        (2, 'Launch IntegraChat Server → click <strong>License</strong> → paste your key above → click <strong>Activate</strong>'),
+        (3, 'Install the <strong>IntegraChat Client app</strong> on office tablets and computers (Android APK also available on the download page)'),
+        (4, 'Connect clients to the server using your office Wi-Fi — they will find the server automatically'),
+      ]])}
+    </table>
+
+    <!-- CTA BUTTON -->
+    <table width="100%" cellpadding="0" cellspacing="0" style="margin-bottom:32px;">
+      <tr><td align="center">
+        <a href="{DOWNLOAD_URL}" style="display:inline-block;background:#ff6b35;color:#ffffff;font-size:15px;font-weight:700;
+           text-decoration:none;border-radius:8px;padding:14px 40px;">Download IntegraChat Now</a>
+      </td></tr>
+    </table>
+
+    <!-- SUPPORT -->
+    <table width="100%" cellpadding="0" cellspacing="0" style="background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0;">
+      <tr><td style="padding:20px 24px;">
+        <p style="margin:0 0 10px;font-size:13px;font-weight:700;color:#1a1a2e;">Need Help? We're here for you.</p>
+        <table cellpadding="0" cellspacing="0">
+          <tr>
+            <td style="padding:4px 0;font-size:13px;color:#475569;">📧 &nbsp;Email Support</td>
+            <td style="padding:4px 0;padding-left:16px;"><a href="mailto:support@integrachatapp.com" style="color:#ff6b35;text-decoration:none;font-size:13px;font-weight:600;">support@integrachatapp.com</a></td>
+          </tr>
+          <tr>
+            <td style="padding:4px 0;font-size:13px;color:#475569;">📞 &nbsp;Phone Support</td>
+            <td style="padding:4px 0;padding-left:16px;"><a href="tel:+14075551234" style="color:#ff6b35;text-decoration:none;font-size:13px;font-weight:600;">(407) 555-1234</a></td>
+          </tr>
+          <tr>
+            <td style="padding:4px 0;font-size:13px;color:#475569;">🌐 &nbsp;Website</td>
+            <td style="padding:4px 0;padding-left:16px;"><a href="https://integrachatapp.com" style="color:#ff6b35;text-decoration:none;font-size:13px;font-weight:600;">integrachatapp.com</a></td>
+          </tr>
+        </table>
+      </td></tr>
+    </table>
+
+  </td></tr>
+
+  <!-- FOOTER -->
+  <tr><td style="background:#1a1a2e;border-radius:0 0 12px 12px;padding:24px 48px;text-align:center;">
+    <p style="margin:0 0 6px;color:#64748b;font-size:12px;">IntegraChat &nbsp;|&nbsp; Intelligent Office Paging for Dental Practices</p>
+    <p style="margin:0;color:#64748b;font-size:12px;">
+      <a href="https://integrachatapp.com" style="color:#ff6b35;text-decoration:none;">integrachatapp.com</a>
+      &nbsp;&bull;&nbsp; support@integrachatapp.com &nbsp;&bull;&nbsp; (407) 555-1234
+    </p>
+    <p style="margin:12px 0 0;color:#334155;font-size:11px;">You received this email because you purchased an IntegraChat license.</p>
+  </td></tr>
+
+</table>
+</td></tr>
+</table>
+</body>
+</html>"""
+
     try:
         resend.Emails.send({
-            "from": FROM_EMAIL,
+            "from": f"IntegraChat <{FROM_EMAIL}>",
             "to": [to_email],
-            "subject": f"Your IntegraChat License Key — {key}",
+            "subject": f"Welcome to IntegraChat — Your {plan.title()} License Key Inside",
             "html": html,
         })
         print(f"[EMAIL] Sent license to {to_email}")
